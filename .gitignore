@@ -1,0 +1,7 @@
+# Create .gitignore with common Python and secret files
+@"
+.env
+__pycache__/
+*.pyc
+uploads/
+"@ | Out-File -Encoding UTF8 .gitignore

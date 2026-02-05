@@ -1,0 +1,14 @@
+fastapi
+uvicorn
+pydantic[email]
+python-dotenv
+passlib[bcrypt]
+python-jose[cryptography]
+twilio
+flask
+flask-mail
+motor
+aiohttp
+redis
+email-validator
+python-multipart
