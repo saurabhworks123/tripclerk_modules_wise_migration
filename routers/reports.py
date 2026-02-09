@@ -776,6 +776,7 @@ from dependencies.database import get_database, get_settings
 from models.request import TravelStatus
 from models.response import DataResponse
 from utils.helpers import safe_object_id, safe_float, utc_now
+from services.email_service import EmailService
 
 router = APIRouter()
 
@@ -1553,17 +1554,40 @@ async def submit_post_travel(
         }}
     )
     
+    
     # Notify supervisor
     supervisor_id = travel_request.get("supervisor_id")
     traveler_name = travel_request.get("traveler_name", "Traveler")
     
     if supervisor_id:
+        # Send in-app notification
         background_tasks.add_task(
             send_notification, db, supervisor_id,
             "Post-Travel Report Submitted",
             f"{traveler_name} has submitted all post-travel reports for review",
             "warning", f"/requests/{request_id}/view"
         )
+        
+        # Send email notification to supervisor
+        supervisor = await db.users.find_one({"_id": ObjectId(supervisor_id)})
+        if supervisor:
+            supervisor_email = supervisor.get("email")
+            supervisor_name = f"{supervisor.get('first_name', '')} {supervisor.get('last_name', '')}".strip()
+            
+            if supervisor_email:
+                background_tasks.add_task(
+                    EmailService.send_post_travel_submitted_notification,
+                    supervisor_email,
+                    {
+                        "supervisor_name": supervisor_name,
+                        "traveler_name": traveler_name,
+                        "ta_number": travel_request.get("ta_number", "N/A"),
+                        "destination": travel_request.get("destination_city", "Unknown"),
+                        "total_expenses": safe_float(expense_report.get("grand_total", 0)),
+                        "link": f"{EmailService.APP_BASE_URL}/requests/{request_id}/view"
+                    }
+                )
+    
     
     return DataResponse(
         success=True,

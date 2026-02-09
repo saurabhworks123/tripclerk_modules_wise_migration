@@ -11,6 +11,7 @@ from fastapi.responses import JSONResponse
 from typing import Optional, List
 from datetime import datetime, timezone, date
 from bson import ObjectId
+from enum import Enum
 import os
 
 from dependencies.database import get_database, get_settings
@@ -500,8 +501,13 @@ async def create_request(
     pov_mileage_estimate: Optional[float] = Form(None),
     pov_rate_per_mile: float = Form(0.67),
     
-    # Supervisor - Accepts name OR email (flexible lookup)
-    supervisor: str = Form(..., description="Supervisor name or email (e.g., 'John Supervisor' or 'john@ntu.edu')"),
+    # Supervisor - Select from available supervisors
+    # Call GET /requests/supervisors to see all available options
+    supervisor: str = Form(
+        ..., 
+        description="Supervisor email. Call GET /requests/supervisors to get available supervisors.",
+        example="himanshu.bansal@harshwal.com"
+    ),
     
     # Department
     department: Optional[str] = Form(None),
@@ -517,6 +523,12 @@ async def create_request(
     budget_file: Optional[UploadFile] = File(None),
     registration_file: Optional[UploadFile] = File(None),
     pov_insurance_file: Optional[UploadFile] = File(None),
+    
+    # Optional: Specify who is creating this request (for testing "create on behalf")
+    created_by: Optional[str] = Form(
+        None, 
+        description="User ID or email of person creating this request. Leave empty if creating for yourself."
+    ),
     
     # NO AUTH - removed current_user dependency
     db = Depends(get_database),
@@ -548,6 +560,74 @@ async def create_request(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Invalid traveler selected"
         )
+    
+    # ============ DETERMINE WHO IS CREATING THIS REQUEST ============
+    # If created_by is provided, lookup that user; otherwise, traveler is creating for themselves
+    
+    if created_by:
+        # Someone specified - lookup by ID or email
+        creator_doc = None
+        
+        # Try by ID first (ObjectId)
+        try:
+            creator_doc = await db.users.find_one({"_id": ObjectId(created_by)})
+        except:
+            pass
+        
+        # If not found, try by email
+        if not creator_doc:
+            creator_doc = await db.users.find_one({"email": created_by})
+        
+        if not creator_doc:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Creator not found: {created_by}"
+            )
+        
+        creator_id = str(creator_doc["_id"])
+        creator_name = f"{creator_doc.get('first_name', '')} {creator_doc.get('last_name', '')}".strip()
+    else:
+        # No creator specified - traveler is creating for themselves
+        creator_doc = traveler
+        creator_id = traveler_id
+        creator_name = f"{traveler.get('first_name', '')} {traveler.get('last_name', '')}".strip()
+    
+    # Get creator's effective role (check job_title)
+    creator_role = creator_doc.get("role", "TRAVELER")
+    creator_job_title = creator_doc.get("job_title", "").upper()
+    
+    effective_creator_role = creator_role
+    if "PRESIDENT" in creator_job_title:
+        effective_creator_role = "PRESIDENT"
+    elif "SUPERVISOR" in creator_job_title:
+        effective_creator_role = "SUPERVISOR"
+    elif "FINANCE" in creator_job_title or "FINANCE HEAD" in creator_job_title:
+        effective_creator_role = "FINANCE"
+    elif "ADMIN" in creator_job_title:
+        effective_creator_role = "ADMIN"
+    
+    # ============ CREATE ON BEHALF PERMISSION CHECK ============
+    is_proxy_request = (creator_id != traveler_id)
+    
+    if is_proxy_request:
+        # Someone is creating on behalf of someone else
+        traveler_name = f"{traveler.get('first_name', '')} {traveler.get('last_name', '')}".strip()
+        
+        # Define who can create on behalf of others
+        can_create_for_others = ["SUPERVISOR", "PRESIDENT", "ADMIN"]
+        
+        if effective_creator_role not in can_create_for_others:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"❌ Permission Denied: {effective_creator_role} cannot create travel requests on behalf of others. {effective_creator_role} can only create requests for themselves."
+            )
+        
+        print(f"✅ Proxy request: {creator_name} ({effective_creator_role}) creating for {traveler_name}")
+    else:
+        print(f"✅ Self request: {creator_name} creating for themselves")
+    
+    # ============ END CREATE ON BEHALF VALIDATION ============
+    
     
     # Find supervisor by email OR by name (flexible lookup)
     supervisor_query = supervisor.strip()
@@ -594,6 +674,100 @@ async def create_request(
     
     # Get supervisor_id from the found supervisor
     supervisor_id = str(supervisor_doc["_id"])
+    
+    # ============ SUPERVISOR SELECTION VALIDATION ============
+    # Validate supervisor selection based on traveler role and destination type
+    
+    # Get traveler role - check both 'role' and 'job_title' fields
+    traveler_role = traveler.get("role", "TRAVELER")
+    traveler_job_title = traveler.get("job_title", "").upper()
+    
+    # Determine effective traveler role (prioritize job_title for President/Supervisor detection)
+    effective_traveler_role = traveler_role
+    if "PRESIDENT" in traveler_job_title:
+        effective_traveler_role = "PRESIDENT"
+    elif "SUPERVISOR" in traveler_job_title:
+        effective_traveler_role = "SUPERVISOR"
+    elif "FINANCE" in traveler_job_title or "FINANCE HEAD" in traveler_job_title:
+        effective_traveler_role = "FINANCE"
+    elif "ADMIN" in traveler_job_title:
+        effective_traveler_role = "ADMIN"
+    
+    # Get supervisor role - check both 'role' and 'job_title' fields
+    supervisor_role = supervisor_doc.get("role", "TRAVELER")
+    supervisor_job_title = supervisor_doc.get("job_title", "").upper()
+    
+    # Determine effective supervisor role (prioritize job_title for President/Supervisor detection)
+    effective_supervisor_role = supervisor_role
+    if "PRESIDENT" in supervisor_job_title:
+        effective_supervisor_role = "PRESIDENT"
+    elif "SUPERVISOR" in supervisor_job_title:
+        effective_supervisor_role = "SUPERVISOR"
+    elif "FINANCE" in supervisor_job_title or "FINANCE HEAD" in supervisor_job_title:
+        effective_supervisor_role = "FINANCE"
+    elif "ADMIN" in supervisor_job_title:
+        effective_supervisor_role = "ADMIN"
+    
+    supervisor_name = f"{supervisor_doc.get('first_name', '')} {supervisor_doc.get('last_name', '')}".strip()
+    
+    # Check if international travel
+    is_international = (travel_destination_type == "international")
+    
+    if is_international:
+        # INTERNATIONAL TRAVEL: Only PRESIDENTS allowed as supervisors
+        if effective_supervisor_role != "PRESIDENT":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"❌ Invalid Supervisor for International Travel: Only PRESIDENTS can be selected as supervisors for international travel. You selected: {supervisor_name} ({effective_supervisor_role}). Please select a PRESIDENT."
+            )
+        print(f"✅ International travel: {supervisor_name} (PRESIDENT) is valid supervisor")
+    else:
+        # DOMESTIC TRAVEL: Role-based validation
+        
+        # Define allowed supervisor roles for each traveler role
+        allowed_supervisor_roles = {
+            "TRAVELER": ["SUPERVISOR", "PRESIDENT"],
+            "SUPERVISOR": ["SUPERVISOR", "PRESIDENT"],
+            "PRESIDENT": ["SUPERVISOR", "PRESIDENT"],
+            "FINANCE": ["SUPERVISOR", "PRESIDENT"],
+            "ADMIN": ["SUPERVISOR", "PRESIDENT"]
+        }
+        
+        # Get allowed roles for this traveler (use effective role)
+        allowed_roles = allowed_supervisor_roles.get(effective_traveler_role, ["SUPERVISOR", "PRESIDENT"])
+        
+        # Check if supervisor role is allowed
+        if effective_supervisor_role not in allowed_roles:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"❌ Invalid Supervisor: {effective_traveler_role} cannot select {effective_supervisor_role} as supervisor. You selected: {supervisor_name} ({effective_supervisor_role}). Allowed supervisor roles: {', '.join(allowed_roles)}."
+            )
+        
+        # Special case: TRAVELER cannot select themselves
+        if effective_traveler_role == "TRAVELER" and traveler_id == supervisor_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"❌ Invalid Supervisor: TRAVELER cannot select themselves as supervisor. Please select a SUPERVISOR or PRESIDENT."
+            )
+        
+        # Special case: FINANCE cannot select themselves
+        if effective_traveler_role == "FINANCE" and traveler_id == supervisor_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"❌ Invalid Supervisor: FINANCE cannot select themselves as supervisor. Please select a SUPERVISOR or PRESIDENT."
+            )
+        
+        # Special case: ADMIN cannot select themselves
+        if effective_traveler_role == "ADMIN" and traveler_id == supervisor_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"❌ Invalid Supervisor: ADMIN cannot select themselves as supervisor. Please select a SUPERVISOR or PRESIDENT."
+            )
+        
+        print(f"✅ Domestic travel: {effective_traveler_role} selecting {supervisor_name} ({effective_supervisor_role}) is valid")
+    
+    # ============ END SUPERVISOR VALIDATION ============
+    
     
     # Parse dates
     req_date = safe_parse_date(date_of_request)
